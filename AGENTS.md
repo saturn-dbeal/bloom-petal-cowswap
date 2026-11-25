@@ -43,6 +43,8 @@ draft body and the status table are in `README.md`. Below, `<o>` is
 
 - A failed write says what to do next. For anything else, read `status.json`
   and act on the status table.
+- A policy update whose link expired: write the same confirm again. The
+  draft is still `quoted`, and Bloom asks for a new update.
 - `outside wallet policy`: tell the owner the policy needs CoW's vault
   relayer. Change policy only if they ask.
 - `outcome still unknown`: read `status.json` until it says `posted`. Do not

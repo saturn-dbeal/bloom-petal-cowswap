@@ -37,8 +37,9 @@ The scaffold pins the SDK to that tag in `route/Cargo.toml`, with
 `host-error-detail` on, and the tag is the Petal's only SDK version:
 
 - `scripts/petal.sh` runs the CLI of the SDK commit `route/Cargo.lock` pins,
-  installing it and its `wasm-tools` on first use, and refuses a commit the
-  tag does not name;
+  installing it and its `wasm-tools` on first use. It refuses a commit the
+  tag does not name, and a commit pin that is not on the SDK repository's
+  `master` or a release tag;
 - `scripts/build.sh`, CI and the release workflow go through it;
 - `petal build` refuses an SDK of another version than its own.
 
@@ -46,6 +47,13 @@ To upgrade, change the tag, run
 `cargo update --manifest-path route/Cargo.toml -p bloom-petal-sdk`, and
 refresh this skill with `scripts/petal.sh skill --root .`. `petal build` and
 `petal check` warn while it is stale.
+
+Until `v0.2.0` is tagged, that tag does not exist. Install the CLI with
+`--rev <commit>`, a commit on the SDK repository's `master`, and in a new
+scaffold replace `tag = "v0.2.0"` in `route/Cargo.toml` with
+`rev = "<commit>"` and `@v0.2.0` in `.github/workflows/release.yml` with
+`@<commit>`. A Petal that already pins a commit keeps it until the tag
+exists.
 
 ## Resolve the product and trust contract
 
@@ -657,8 +665,14 @@ helpers such as `petal::read_store` return `-4`, which reaches the caller as
   claim's nonce or effects, is a new request with its own approval. A retry
   that keeps the claim but changes its `action` or `advisory` is refused
   (`exact signing retry differs from its persisted operation identity`). A
-  retry before the owner approves is refused (`approval is not active`), and
-  one five minutes after the first attempt opens a new ceremony.
+  retry while the owner's ceremony is still open reports the same pending
+  request again. With the exact selector, once the ceremony ends without
+  approval, expired after five minutes or cancelled, every retry of that
+  request is refused (`approval is not active`): Bloom replays the request and
+  opens no second ceremony. To ask again, change the payload, for example with
+  a fresh quote, and tell the caller to start over rather than retry. A
+  reusable request is keyed by route, wallet and operation class, not by its
+  payload, so this does not describe it.
   Do not pass the pending action id back as `approval_hint`; a hint other than
   the derived request id is refused.
 - **One live ceremony per wallet.** While an owner ceremony is pending, a

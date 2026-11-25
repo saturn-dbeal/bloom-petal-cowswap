@@ -15,7 +15,7 @@ jobs:
     # itself; keep it at the same commit as the SDK pin in route/Cargo.toml.
     # The workflow takes an SDK commit only if it is on bloom-directory/petal's
     # master or is a release tag.
-    uses: bloom-directory/petal/.github/workflows/release-petal.yml@81882e7e7772af3f37ff94565d375a16cb0dcba6
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@67b4038452de1247de462d5092f925d3d21539e0
     with:
       petal-name: cowswap
       # Fails the release if a route goes missing from the package.

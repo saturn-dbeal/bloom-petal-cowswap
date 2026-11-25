@@ -30,11 +30,13 @@ scripts/petal.sh check
 
 Then validate the built package with `bloom petals build .`.
 
-`route/Cargo.toml` pins the SDK by commit until the SDK's `v0.2.0` release is
-tagged. To move to another SDK commit, change `rev` there, run
+`route/Cargo.toml` pins the SDK by a commit on `bloom-directory/petal`'s
+`master` until the SDK's `v0.2.0` release is tagged. To move to another SDK
+commit, change `rev` there, run
 `cargo update --manifest-path route/Cargo.toml -p bloom-petal-sdk`, and set the
-same commit in `.github/workflows/release.yml`. Once the tag exists, pin
-`tag = "v0.2.0"` instead.
+same commit in `.github/workflows/release.yml`. `scripts/petal.sh` refuses a
+commit that is not on `master`. Once the tag exists, pin `tag = "v0.2.0"`
+instead.
 
 To build with a petal CLI you built yourself:
 
@@ -84,5 +86,3 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds and
 packages with the petal CLI of the pinned SDK commit and publishes the
 archive, its checksum and `petal-release.json`. The workflow takes an SDK
 commit only if it is on `bloom-directory/petal`'s `master` or is a release tag.
-The commit pinned today is on a pull request branch, so a release has to wait
-until that work is merged and the pin moves to the merged commit.

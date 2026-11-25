@@ -1,15 +1,13 @@
 #!/bin/sh
-# Run the petal CLI of the SDK commit this Petal pins.
+# Run the petal CLI of the SDK this Petal pins.
 #
-# route/Cargo.toml names the SDK tag or commit, and route/Cargo.lock records
-# the commit. The first time it sees that commit, this installs the petal CLI
-# from it, with the wasm-tools release it builds with, under
-# ~/.cache/bloom-petal. For a tag it first checks that the tag names the
-# commit. So the SDK pin is the only version to change. PETAL_BIN names
-# another binary, as the release workflow does.
-#
-# This differs from the SDK scaffold's script in one way: it also takes a
-# commit pin (`rev = "..."`), for use until the SDK release is tagged.
+# route/Cargo.toml names the SDK release tag, or a commit, and
+# route/Cargo.lock records the commit. The first time it sees that pin, this
+# checks it: a tag must name the commit, and a commit must be on the SDK
+# repository's master or a release tag. Then it installs the petal CLI from
+# the commit, with the wasm-tools release it builds with, under
+# ~/.cache/bloom-petal. So the SDK pin is the only version to change.
+# PETAL_BIN names another binary, as the release workflow does.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -33,11 +31,13 @@ repo=https://github.com/bloom-directory/petal
 tag=
 case "$source" in
   "git+$repo?tag="*"#"* | "git+$repo.git?tag="*"#"*)
+    kind=tag
     pin=${source#*\?tag=}
     tag=${pin%%#*}
     commit=${pin##*#}
     ;;
   "git+$repo?rev="*"#"* | "git+$repo.git?rev="*"#"*)
+    kind=commit
     commit=${source##*#}
     ;;
   "")
@@ -52,7 +52,7 @@ case "$source" in
 esac
 # The tag and commit go into a Git ref and a path below, so take only a
 # release tag and a full commit.
-if [ -n "$tag" ]; then
+if [ "$kind" = tag ]; then
   case "$tag" in
     v[0-9]*) ;;
     *) commit= ;;
@@ -69,21 +69,21 @@ if [ "${#commit}" -ne 40 ]; then
   exit 1
 fi
 
-tools=${PETAL_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/bloom-petal}/$commit
-install_cli() {
-  if [ ! -x "$tools/bin/petal" ]; then
-    echo "petal.sh: installing the petal CLI at $commit into $tools" >&2
-    cargo install --locked --quiet --git "$repo" --rev "$commit" --root "$tools" bloom-petal-cli
-  fi
-}
-if [ -n "$tag" ]; then
-  # GitHub serves a commit from any fork of the repository at its URL, so run
-  # only the commit the tag names. A file per tag records that it named this
-  # commit when checked. Without one, check, even with a CLI already here: an
-  # earlier petal.sh installed without checking, and the CLI may have been
-  # installed for another tag.
+cache=${PETAL_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/bloom-petal}
+tools=$cache/$commit
+# GitHub serves a commit from any fork of the repository at its URL, so run
+# only a commit the repository vouches for: the one a tag pin's tag names, or
+# for a commit pin, one on master or a release tag. A file per pin records
+# that it passed. Without one, check, even with a CLI already here: an earlier
+# petal.sh installed without checking, and the CLI may have been installed
+# for another pin.
+if [ "$kind" = tag ]; then
   checked=$tools/checked-tags/$tag
-  if [ ! -f "$checked" ]; then
+else
+  checked=$tools/checked-commit
+fi
+if [ ! -f "$checked" ]; then
+  if [ "$kind" = tag ]; then
     if ! refs=$(git ls-remote "$repo" "refs/tags/$tag" "refs/tags/$tag^{}"); then
       echo "petal.sh: could not read $tag from $repo" >&2
       exit 1
@@ -97,15 +97,56 @@ if [ -n "$tag" ]; then
       echo "petal.sh: $lock pins $tag at $commit, but $repo names ${named:-no commit} for $tag" >&2
       exit 1
     fi
-    install_cli
-    mkdir -p "$tools/checked-tags"
-    : >"$checked"
+  else
+    # The release workflow applies the same rule, in a repository it makes
+    # for the check. So does this: one kept in the cache would still hold a
+    # release tag the SDK repository has since deleted, and two Petals
+    # checking at once would contend for it. A full fetch, not a partial
+    # clone, which would fetch a missing commit on demand.
+    #
+    # Git gives a hook GIT_DIR, which outranks -C, so a check run from a hook
+    # would fetch into the Petal's own repository and move its master and
+    # tags. Name the repository outright, without Git's own environment.
+    mkdir -p "$cache"
+    history=$(mktemp -d "$cache/sdk-history.XXXXXX")
+    history_git() {
+      (
+        unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+          GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+        git --git-dir="$history" "$@"
+      )
+    }
+    verdict=refused
+    if ! history_git init --quiet --bare ||
+      ! history_git fetch --quiet --no-tags "$repo" \
+        '+refs/heads/master:refs/heads/master' '+refs/tags/v*:refs/tags/v*'; then
+      verdict=unread
+    # The pin must be the commit itself: Git would read a tag's own id as the
+    # commit it names.
+    elif [ "$(history_git rev-parse --verify --quiet "$commit^{commit}" 2>/dev/null)" = "$commit" ] && {
+      history_git merge-base --is-ancestor "$commit" refs/heads/master 2>/dev/null ||
+        [ -n "$(history_git for-each-ref --contains "$commit" 'refs/tags/v[0-9]*' 2>/dev/null)" ]
+    }; then
+      verdict=accepted
+    fi
+    rm -rf "$history"
+    case "$verdict" in
+      unread)
+        echo "petal.sh: could not read master and the release tags from $repo" >&2
+        exit 1
+        ;;
+      refused)
+        echo "petal.sh: $lock pins commit $commit, which is not on master or a release tag of $repo; pin one that is, or set PETAL_BIN to a petal CLI you built" >&2
+        exit 1
+        ;;
+    esac
   fi
-else
-  # A commit pin names the commit outright, so there is no tag to check it
-  # against. This is the commit Cargo already builds the SDK from. The release
-  # workflow takes it only if it is on the SDK repository's master.
-  install_cli
+  if [ ! -x "$tools/bin/petal" ]; then
+    echo "petal.sh: installing the petal CLI at $commit into $tools" >&2
+    cargo install --locked --quiet --git "$repo" --rev "$commit" --root "$tools" bloom-petal-cli
+  fi
+  mkdir -p "${checked%/*}"
+  : >"$checked"
 fi
 
 # Build with the wasm-tools release this CLI is tested with.
