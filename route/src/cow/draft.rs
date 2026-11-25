@@ -30,6 +30,10 @@ pub enum DraftStatus {
     Quoted,
     /// Bloom reported a pending owner approval for the signing request.
     SigningPending,
+    /// The owner approval expired or was declined before the order was
+    /// signed. A later confirm asks again; if Bloom still refuses, the agent
+    /// needs a new draft.
+    ApprovalLapsed,
     /// Signature obtained and order POST accepted by the orderbook.
     Posted,
     /// POST outcome unknown after signing; next confirm reconciles by UID.
@@ -74,6 +78,23 @@ pub struct OrderDraft {
     pub attempts: u32,
     #[serde(default)]
     pub created_ms: u64,
+}
+
+impl OrderDraft {
+    /// The UID the orderbook gives this draft's order: `0x` + 112 hex
+    /// characters. The order, its owner and the network fix it, so it is
+    /// known before the order is posted and can always be looked up.
+    pub fn expected_uid(&self, network: CowNetwork) -> Result<String, String> {
+        let order = self.order.to_gpv2()?;
+        let owner = self
+            .owner
+            .parse::<Address>()
+            .map_err(|_| "stored owner address is invalid".to_string())?;
+        Ok(format!(
+            "0x{}",
+            hex::encode(crate::cow::order::order_uid(&order, owner, network))
+        ))
+    }
 }
 
 /// A pending owner approval for this draft's signing request.
@@ -142,21 +163,29 @@ pub fn max_sell_amount(quoted_sell: U256, slippage_bps: u64) -> U256 {
 }
 
 /// Build the slippage-bounded order view from a quote.
+///
+/// The orderbook refuses an order whose `feeAmount` is not zero
+/// (`NonZeroFee`), so the network costs the quote reports as `feeAmount` are
+/// paid from the signed amounts instead: a sell order sells the whole
+/// requested amount, `sellAmount + feeAmount`, and a buy order bounds that
+/// sum with slippage.
 pub fn order_from_quote(
     quote: &QuotedOrder,
     side: QuoteSide,
     slippage_bps: u64,
 ) -> Result<SignedOrderView, String> {
     let parse = |value: &str| U256::from_str_radix(value, 10);
+    let quoted_sell = parse(&quote.sell_amount).map_err(|_| "quote sellAmount")?;
+    let quoted_fee = parse(&quote.fee_amount).map_err(|_| "quote feeAmount")?;
+    let sell_with_fee = quoted_sell
+        .checked_add(quoted_fee)
+        .ok_or("quote sellAmount plus feeAmount overflows")?;
     let (sell_amount, buy_amount, kind) = match side {
         QuoteSide::Sell => {
             let quoted_buy = parse(&quote.buy_amount).map_err(|_| "quote buyAmount")?;
-            (quote.sell_amount.clone(), min_buy_amount(quoted_buy, slippage_bps).to_string(), "sell")
+            (sell_with_fee.to_string(), min_buy_amount(quoted_buy, slippage_bps).to_string(), "sell")
         }
-        QuoteSide::Buy => {
-            let quoted_sell = parse(&quote.sell_amount).map_err(|_| "quote sellAmount")?;
-            (max_sell_amount(quoted_sell, slippage_bps).to_string(), quote.buy_amount.clone(), "buy")
-        }
+        QuoteSide::Buy => (max_sell_amount(sell_with_fee, slippage_bps).to_string(), quote.buy_amount.clone(), "buy"),
     };
     if quote.kind != kind {
         return Err(format!(
@@ -173,7 +202,7 @@ pub fn order_from_quote(
         valid_to: quote.valid_to,
         app_data: format!("{:#x}", app_data::app_data_hash()),
         app_data_document: app_data::app_data_document(),
-        fee_amount: quote.fee_amount.clone(),
+        fee_amount: "0".into(),
         kind: kind.to_string(),
         partially_fillable: false,
         sell_token_balance: "erc20".into(),
@@ -195,7 +224,12 @@ pub fn load_draft(key: &str) -> Result<OrderDraft, DispatchResponse> {
         Err(SdkError::Host(HostStatus::NotFound)) => {
             return Err(petal::error(-1, "order draft not found"))
         }
-        Err(error) => return Err(petal::error(-4, format!("read draft: {}", error.message()))),
+        Err(error) => {
+            return Err(petal::error(
+                -4,
+                format!("read draft: {}", petal::sdk::describe_error(&error)),
+            ));
+        }
     };
     let draft: OrderDraft = serde_json::from_slice(&bytes)
         .map_err(|e| petal::error(-4, format!("draft record is corrupt: {e}")))?;
@@ -210,11 +244,29 @@ pub fn save_draft(key: &str, draft: &OrderDraft) -> Result<(), DispatchResponse>
     let bytes = serde_json::to_vec(draft)
         .map_err(|e| petal::error(-4, format!("encode draft: {e}")))?;
     petal::sdk::store_put(key, &bytes, false)
-        .map_err(|e| petal::error(-4, format!("persist draft: {}", e.message())))
+        .map_err(|e| petal::error(-4, format!("persist draft: {}", petal::sdk::describe_error(&e))))
 }
 
-/// The parsed side of a draft request body.
+/// Persist a newly created draft, refusing to replace one already stored
+/// under the same id.
+fn save_new_draft(key: &str, draft: &OrderDraft) -> Result<(), DispatchResponse> {
+    let bytes = serde_json::to_vec(draft)
+        .map_err(|e| petal::error(-4, format!("encode draft: {e}")))?;
+    petal::sdk::store_put_new(key, &bytes, false).map_err(|e| {
+        petal::error(
+            -4,
+            format!(
+                "persist new draft: {}; write the request again",
+                petal::sdk::describe_error(&e)
+            ),
+        )
+    })
+}
+
+/// The parsed side of a draft request body. An unknown field is refused: a
+/// misspelt `slippage_bps` must not silently become the default.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewDraftRequest {
     pub sell_token: String,
     pub buy_token: String,
@@ -289,8 +341,12 @@ pub fn create_draft(
         Ok(view) => view,
         Err(e) => return petal::error(-4, format!("quote did not yield an orderable shape: {e}")),
     };
-    let now_ms = petal::sdk::try_now_ms().unwrap_or_default();
-    let id = mint_draft_id(network, account, &request, now_ms);
+    let now_ms = match petal::sdk::try_now_ms() {
+        Ok(ms) => ms,
+        Err(e) => return petal::error(-4, format!("read clock: {}", petal::sdk::describe_error(&e))),
+    };
+    let entropy = draft_id_entropy(network, account, &request, now_ms);
+    let id = mint_draft_id(now_ms, entropy);
     let draft = OrderDraft {
         schema: "bloom.cowswap.order_draft.v1".into(),
         id: id.clone(),
@@ -314,16 +370,33 @@ pub fn create_draft(
         created_ms: now_ms,
     };
     let key = draft_key(network.api_env(), account.wallet(), account.number(), &id);
-    if let Err(resp) = save_draft(&key, &draft) {
+    if let Err(resp) = save_new_draft(&key, &draft) {
         return resp;
     }
     petal::DispatchResponse::Write
 }
 
-/// A fresh draft id: `od-` + 16 hex characters derived from the request,
-/// the account, and a time+randomness nonce. Hex by construction, so the id
-/// is a safe store-key and URL segment without further checks.
-fn mint_draft_id(network: CowNetwork, account: &WalletAccount, request: &NewDraftRequest, now_ms: u64) -> String {
+/// A fresh draft id: `od-` + 16 hex characters. The first 11 are the
+/// creation time in milliseconds and the last 5 are random, so ids sort by
+/// creation time and the newest draft is the last one listed. Hex by
+/// construction, so the id is a safe store-key and URL segment without
+/// further checks.
+fn mint_draft_id(now_ms: u64, entropy: u32) -> String {
+    format!(
+        "od-{:011x}{:05x}",
+        now_ms & 0xfff_ffff_ffff,
+        entropy & 0xf_ffff
+    )
+}
+
+/// Random bits for a draft id, mixed with the request so two drafts made in
+/// the same millisecond still differ if the host's randomness fails.
+fn draft_id_entropy(
+    network: CowNetwork,
+    account: &WalletAccount,
+    request: &NewDraftRequest,
+    now_ms: u64,
+) -> u32 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     network.api_env().hash(&mut hasher);
@@ -336,7 +409,7 @@ fn mint_draft_id(network: CowNetwork, account: &WalletAccount, request: &NewDraf
     now_ms.hash(&mut hasher);
     let entropy = petal::sdk::random_bytes(8).unwrap_or_default();
     hasher.write(&entropy);
-    format!("od-{:016x}", hasher.finish())
+    hasher.finish() as u32
 }
 
 /// The public, reviewable projection of a draft: everything the owner or an
@@ -438,14 +511,15 @@ mod tests {
     fn sell_order_view_carries_the_quote_and_bounds() {
         let view = order_from_quote(&quoted("sell"), QuoteSide::Sell, 50).unwrap();
         assert_eq!(view.kind, "sell");
-        assert_eq!(view.sell_amount, "9999312248");
+        // 9999312248 + 687752: the whole sellAmountBeforeFee the quote asked for.
+        assert_eq!(view.sell_amount, "10000000000");
         assert_eq!(
             view.buy_amount,
             (U256::from(4_308_666_162_407_131_131u128) * U256::from(9_950u64)
                 / U256::from(10_000u64))
             .to_string()
         );
-        assert_eq!(view.fee_amount, "687752");
+        assert_eq!(view.fee_amount, "0");
         assert_eq!(view.valid_to, 1_793_804_915);
         assert!(!view.partially_fillable);
         assert_eq!(view.sell_token_balance, "erc20");
@@ -466,11 +540,9 @@ mod tests {
         let view = order_from_quote(&quoted("buy"), QuoteSide::Buy, 100).unwrap();
         assert_eq!(view.kind, "buy");
         assert_eq!(view.buy_amount, "4308666162407131131");
-        // ceil(9999312248 * 10100 / 10000)
-        let expected = (U256::from(9_999_312_248u64) * U256::from(10_100u64)
-            + U256::from(9_999u64))
-            / U256::from(10_000u64);
-        assert_eq!(view.sell_amount, expected.to_string());
+        // ceil((9999312248 + 687752) * 10100 / 10000)
+        assert_eq!(view.sell_amount, "10100000000");
+        assert_eq!(view.fee_amount, "0");
     }
 
     #[test]
@@ -553,5 +625,74 @@ mod tests {
         let back: OrderDraft = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, draft);
         assert_eq!(back.status, DraftStatus::Posted);
+    }
+
+    #[test]
+    fn draft_ids_sort_by_creation_time() {
+        let first = mint_draft_id(1_793_800_000_000, 0xf_ffff);
+        let second = mint_draft_id(1_793_800_000_001, 0);
+        let later = mint_draft_id(1_793_900_000_000, 0x12345);
+        assert!(first < second && second < later, "{first} {second} {later}");
+        for id in [&first, &second, &later] {
+            assert!(params::parse_draft_id(id).is_ok(), "{id}");
+        }
+        // Entropy beyond 20 bits and time beyond 44 bits cannot widen the id.
+        assert_eq!(mint_draft_id(u64::MAX, u32::MAX), "od-ffffffffffffffff");
+    }
+
+    #[test]
+    fn a_new_draft_request_refuses_an_unknown_field() {
+        let known = br#"{"sell_token":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","buy_token":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","kind":"sell","amount":"1","slippage_bps":10}"#;
+        assert!(serde_json::from_slice::<NewDraftRequest>(known).is_ok());
+        // A misspelt slippage key must not silently become the default.
+        let misspelt = br#"{"sell_token":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","buy_token":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","kind":"sell","amount":"1","slippageBps":10}"#;
+        assert!(serde_json::from_slice::<NewDraftRequest>(misspelt).is_err());
+    }
+
+    #[test]
+    fn expected_uid_is_the_order_uid_and_a_valid_uid() {
+        let draft = OrderDraft {
+            schema: "bloom.cowswap.order_draft.v1".into(),
+            id: "od-0123456789abcdef".into(),
+            network: "mainnet".into(),
+            chain_id: 1,
+            wallet: "kaze".into(),
+            account: 0,
+            owner: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            side: QuoteSide::Sell,
+            sell_token: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            buy_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            input_amount: "10000000000".into(),
+            slippage_bps: 50,
+            quote: quoted("sell"),
+            order: order_from_quote(&quoted("sell"), QuoteSide::Sell, 50).unwrap(),
+            status: DraftStatus::Quoted,
+            approval: None,
+            uid: None,
+            last_error: None,
+            attempts: 0,
+            created_ms: 42,
+        };
+        let uid = draft.expected_uid(CowNetwork::Mainnet).unwrap();
+        assert!(params::parse_order_uid(&uid).is_ok(), "{uid}");
+        let owner: Address = draft.owner.parse().unwrap();
+        let order = draft.order.to_gpv2().unwrap();
+        assert_eq!(
+            uid,
+            format!(
+                "0x{}",
+                hex::encode(crate::cow::order::order_uid(&order, owner, CowNetwork::Mainnet))
+            )
+        );
+        // The network is part of the UID.
+        assert_ne!(uid, draft.expected_uid(CowNetwork::Sepolia).unwrap());
+    }
+
+    #[test]
+    fn the_lapsed_approval_status_has_a_stable_name() {
+        assert_eq!(
+            serde_json::to_string(&DraftStatus::ApprovalLapsed).unwrap(),
+            "\"approval_lapsed\""
+        );
     }
 }

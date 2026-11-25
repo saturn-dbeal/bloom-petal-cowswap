@@ -1,0 +1,22 @@
+name: Release Petal
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    # The workflow builds and packages with the petal CLI of the SDK commit
+    # that route/Cargo.lock pins. This reference selects only the workflow
+    # itself; keep it at the same commit as the SDK pin in route/Cargo.toml.
+    # The workflow takes an SDK commit only if it is on bloom-directory/petal's
+    # master or is a release tag.
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@67b4038452de1247de462d5092f925d3d21539e0
+    with:
+      petal-name: cowswap
+      # Fails the release if a route goes missing from the package.
+      expected-route-count: 24
